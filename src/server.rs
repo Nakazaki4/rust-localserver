@@ -1,25 +1,31 @@
-use crate::config::{Route, ServerConfig};
+use crate::config::ServerConfig;
 use mio::net::TcpListener;
-use mio::{Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, event};
 use std::collections::HashMap;
+use std::fmt;
 use std::net::{SocketAddr, TcpStream};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-const SERVER_TOKEN_MAX: usize = 100;
+pub const SERVER_TOKEN_MAX: usize = 100;
 
 pub struct Server {
-    routes: Vec<Route>,
     poll: Poll,
-    config: ServerConfig,
-    listeners: Box<HashMap<Token, ListenerEntry>>,
-    connections: Box<HashMap<Token, Connection>>,
-    pending_cgi: Box<HashMap<Token, PendingCgi>>,
+    listeners: HashMap<Token, ListenerEntry>,
+    connections: HashMap<Token, Connection>,
+    pending_cgi: HashMap<Token, PendingCgi>,
+    sessions: HashMap<String, Session>,
     next_token: usize,
+}
+
+pub struct Session {
+    pub data: HashMap<String, String>,
+    pub last_seen: Instant,
 }
 
 struct ListenerEntry {
     listener: TcpListener,
-    server_idx: usize,
+    addr: SocketAddr,
+    configs: Vec<ServerConfig>,
 }
 
 struct PendingCgi {
@@ -37,49 +43,95 @@ struct Connection {
     pub read_buffer: Vec<u8>,
     pub is_request_complete: bool,
 }
-
 impl Server {
-    fn new(config: ServerConfig) -> Self {
-        Server {
-            routes: Vec::new(),
-            poll: Poll::new().expect("failed to create mio poll"),
-            config: config,
-            listeners: Box::new(HashMap::new()),
-            connections: Box::new(HashMap::new()),
-            pending_cgi: Box::new(HashMap::new()),
+    /// Takes ALL server configs — there is exactly one Server and one Poll
+    /// for the whole program, no matter how many server blocks exist.
+    pub fn new() -> Result<Self, String> {
+        Ok(Server {
+            poll: Poll::new().map_err(|e| format!("failed to create poll: {e}"))?,
+            listeners: HashMap::new(),
+            connections: HashMap::new(),
+            pending_cgi: HashMap::new(),
+            sessions: HashMap::new(),
             next_token: SERVER_TOKEN_MAX,
-        }
+        })
     }
 
-    pub fn bind(sc: ServerConfig, idx: usize) -> Result<(), String> {
-        let mut server = Self::new(sc);
+    pub fn bind(configs: Vec<ServerConfig>) -> Result<Server, String> {
+        let mut server = Self::new()?;
 
-        let addr = format!("{}:{}", server.config.host, server.config.port)
-            .parse()
-            .map_err(|e| format!("Invalid address: {}", e))?;
-        match TcpListener::bind(addr) {
-            Ok(mut listener) => {
-                let token = Token(idx);
+        let mut by_addr: Vec<(SocketAddr, Vec<ServerConfig>)> = Vec::new();
+        for sc in configs {
+            for port in &sc.ports {
+                let addr: SocketAddr = format!("{}:{}", sc.host, port)
+                    .parse()
+                    .map_err(|e| format!("invalid address {}:{}: {e}", sc.host, port))?;
 
-                server
-                    .poll
-                    .registry()
-                    .register(&mut listener, token, Interest::READABLE)
-                    .map_err(|e| e.to_string())?;
-
-                server.listeners.insert(
-                    token,
-                    ListenerEntry {
-                        listener,
-                        server_idx: idx,
-                    },
-                );
+                match by_addr.iter_mut().find(|(a, _)| *a == addr) {
+                    Some((_, group)) => group.push(sc.clone()),
+                    None => by_addr.push((addr, vec![sc.clone()])),
+                }
             }
-            Err(e) => eprintln!("failed to bind {}: {}", addr, e),
         }
+
+        let mut token_counter = 0;
+        for (addr, group) in by_addr {
+            match TcpListener::bind(addr) {
+                Ok(mut listener) => {
+                    let token = Token(token_counter);
+                    token_counter += 1;
+                    if token_counter >= SERVER_TOKEN_MAX {
+                        return Err("too many listeners".to_string());
+                    }
+
+                    server
+                        .poll
+                        .registry()
+                        .register(&mut listener, token, Interest::READABLE)
+                        .map_err(|e| format!("register {addr}: {e}"))?;
+
+                    server.listeners.insert(
+                        token,
+                        ListenerEntry {
+                            listener,
+                            addr,
+                            configs: group,
+                        },
+                    );
+                }
+                Err(e) => eprintln!("warning: failed to bind {addr}: {e}"),
+            }
+        }
+
         if server.listeners.is_empty() {
-            return Err("no ports were found".to_string());
+            return Err("no listener could be bound".to_string());
         }
-        Ok(())
+        Ok(server)
+    }
+
+    pub fn run(&mut self) {
+        let mut events = Events::with_capacity(2048);
+        loop {
+            if let Err(e) = self
+                .poll
+                .poll(&mut events, Some(Duration::from_millis(2000)))
+            {
+                eprintln!("Poll error :{e}");
+            };
+            for event in &events {
+                let listener = self.listeners.get(&event.token());
+                
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Server {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Server")
+            .field("listeners", &self.listeners.keys().collect::<Vec<_>>())
+            .field("connections", &self.connections.len())
+            .field("next_token", &self.next_token)
+            .finish()
     }
 }

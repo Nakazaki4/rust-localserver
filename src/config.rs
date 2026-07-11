@@ -1,19 +1,19 @@
 use std::{collections::HashMap, fs};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
-    pub port: u16,
-    pub max_body_size: usize,
-    pub routes: Vec<Route>,
-    pub error_pages: HashMap<u16, String>,
+    pub ports: Vec<u16>,
     pub default: bool,
+    pub max_body_size: usize, // 413 when exceeded
+    pub error_pages: HashMap<u16, String>,
+    pub routes: Vec<Route>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Route {
     path: String,
-    methods: Vec<u16>,
+    methods: Vec<HttpMethod>,
     root: String,
     index: Option<String>,
     redirect: Option<String>,
@@ -22,6 +22,8 @@ pub struct Route {
     cgi_extension: Option<String>,
     cgi_interpreter: Option<String>,
 }
+
+#[derive(Debug, Clone)]
 enum HttpMethod {
     GET,
     POST,
@@ -59,11 +61,11 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             host: "127.0.0.1".to_string(),
-            port: 8080,
+            ports: Vec::new(),
+            default: false,
             max_body_size: 1024 * 1024,
-            routes: Vec::new(),
             error_pages: HashMap::new(),
-            default: true,
+            routes: Vec::new(),
         }
     }
 }
@@ -123,19 +125,27 @@ pub fn parse_config(path: &str) -> Result<Vec<ServerConfig>, String> {
             match key {
                 "root" => route.root = value.to_string(),
                 "methods" => {
-                    let mut methods: Vec<HttpMethod> = Vec::new();
                     for m in &parts[1..] {
-                        methods.push(HttpMethod::parse(m)?);
+                        route.methods.push(HttpMethod::parse(m)?);
                     }
                 }
-                "upload" => route.upload = true,
-                "directory_listing" => match value {
-                    "false" => route.directory_listing = false,
-                    "true" => route.directory_listing = true,
-                    _ => panic!("directory_listing should be either false true"),
-                },
+                "upload" => {
+                    route.upload = match value {
+                        "true" => true,
+                        "false" => false,
+                        _ => panic!("upload type should be boolean"),
+                    }
+                }
+                "directory_listing" => {
+                    route.directory_listing = match value {
+                        "false" => false,
+                        "true" => true,
+                        _ => panic!("directory_listing should be either false true"),
+                    }
+                }
                 "index" => route.index = Some(value.to_string()),
                 "cgi_extension" => route.cgi_extension = Some(value.to_string()),
+                "cgi_interpreter" => route.cgi_interpreter = Some(value.to_string()),
                 "redirect" => route.redirect = Some(value.to_string()),
                 _ => panic!("{}", format!("unsupported route config key: {}", key)),
             }
@@ -143,13 +153,28 @@ pub fn parse_config(path: &str) -> Result<Vec<ServerConfig>, String> {
             let value = parts[1].to_string();
             match key {
                 "host" => server.host = value,
-                "port" => server.port = value.parse().unwrap(),
+                "port" => {
+                    for p in &parts[1..] {
+                        let port: u16 = p
+                            .parse()
+                            .map_err(|_| format!("line {lineno}: invalid port `{p}`"))?;
+                        if server.ports.contains(&port) {
+                            return Err(format!(
+                                "line {lineno}: port {port} listed twice in one server"
+                            ));
+                        }
+                        server.ports.push(port);
+                    }
+                }
                 "default" => server.default = value == "true",
                 "max_body_size" => server.max_body_size = value.parse().unwrap(),
                 "error_page" => {
                     if parts.len() != 3 {
                         return Err(format!("line {lineno}: error_page expects <code> <path>"));
                     }
+                    server
+                        .error_pages
+                        .insert(parts[1].parse().unwrap(), parts[2].to_string());
                 }
                 _ => panic!("{}", format!("unsupported server config key: {}", key)),
             }
@@ -159,32 +184,3 @@ pub fn parse_config(path: &str) -> Result<Vec<ServerConfig>, String> {
     }
     Ok(app_config)
 }
-
-// #[derive(Debug)]
-// pub struct Route {
-//     pub path: String,
-//     pub methods: Vec<HttpMethod>, // was [HttpMethod; 3] — can't hold "GET" alone or "GET POST"
-//     pub root: String,
-//     pub index: Option<String>,
-//     pub redirect: Option<String>,
-//     pub upload: bool,
-//     pub directory_listing: bool, // fixed the "diretory" typo
-//     pub cgi_extension: Option<String>,
-//     pub cgi_interpreter: Option<String>,
-// }
-
-// impl Default for Route {
-//     fn default() -> Self {
-//         Self {
-//             path: String::new(),
-//             methods: Vec::new(),
-//             root: String::new(),
-//             index: None,
-//             redirect: None,
-//             upload: false,
-//             directory_listing: false,
-//             cgi_extension: None,
-//             cgi_interpreter: None,
-//         }
-//     }
-// }
