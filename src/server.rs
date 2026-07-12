@@ -1,10 +1,12 @@
 use crate::config::ServerConfig;
-use mio::net::TcpListener;
-use mio::{Events, Interest, Poll, Token, event};
+use mio::event::Event;
+use mio::net::{TcpListener, TcpStream};
+use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
-use std::fmt;
-use std::net::{SocketAddr, TcpStream};
+use std::io::Read;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+use std::{fmt, io};
 
 pub const SERVER_TOKEN_MAX: usize = 100;
 
@@ -38,11 +40,23 @@ struct PendingCgi {
 
 struct Connection {
     pub stream: TcpStream,
-    pub server_idx: usize,
+    pub listener_token: Token,
     pub last_activity: Instant,
     pub read_buffer: Vec<u8>,
     pub is_request_complete: bool,
 }
+impl Connection {
+    fn new(stream: TcpStream, listener_token: Token) -> Self {
+        Self {
+            stream,
+            listener_token,
+            last_activity: Instant::now(),
+            read_buffer: Vec::with_capacity(4096),
+            is_request_complete: false,
+        }
+    }
+}
+
 impl Server {
     /// Takes ALL server configs — there is exactly one Server and one Poll
     /// for the whole program, no matter how many server blocks exist.
@@ -119,8 +133,83 @@ impl Server {
                 eprintln!("Poll error :{e}");
             };
             for event in &events {
-                let listener = self.listeners.get(&event.token());
-                
+                let token = event.token();
+
+                if self.listeners.contains_key(&token) {
+                    // if the token belongs to a listener then should accept the connection
+                    self.accept_connection(token);
+                } else if self.connections.contains_key(&token) {
+                    // if the token belongs to a connection that means we have an event form epoll
+                    self.handle_client_event(event);
+                }
+            }
+        }
+    }
+
+    fn handle_client_event(&mut self, event: &Event) {
+        let connection_token = event.token();
+
+        let conn = match self.connections.get_mut(&connection_token) {
+            Some(c) => c,
+            None => return,
+        };
+
+        if event.is_readable() {
+            let mut buf = [0u8; 4096];
+            loop {
+                match conn.stream.read(&mut buf) {
+                    Ok(0) => {
+                        self.close_connection();
+                        return;
+                    }
+                    Ok(n) => {
+                        conn.read_buffer.extend_from_slice(&buf[..n]);
+                        conn.last_activity = Instant::now();
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        eprintln!("read error on {connection_token:?}: {e}");
+                        self.close_connection(token);
+                        return;
+                    }
+                };
+            }
+
+            // self.parse_request(event);
+        }
+        
+    }
+
+    fn accept_connection(&mut self, listener_token: Token) {
+        loop {
+            let accept_result = match self.listeners.get(&listener_token) {
+                Some(entry) => entry.listener.accept(),
+                None => return,
+            };
+
+            match accept_result {
+                Ok((mut stream, _addr)) => {
+                    let connection_token = Token(self.next_token);
+                    self.next_token += 1;
+
+                    if let Err(e) = self.poll.registry().register(
+                        &mut stream,
+                        connection_token,
+                        Interest::READABLE,
+                    ) {
+                        eprintln!("registring the connection to Poll failed {e}");
+                        continue;
+                    }
+
+                    self.connections
+                        .insert(connection_token, Connection::new(stream, listener_token));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    eprintln!("accept error on {listener_token:?}: {e}");
+                    break;
+                }
             }
         }
     }
