@@ -24,7 +24,7 @@ pub struct Route {
 }
 
 #[derive(Debug, Clone)]
-enum HttpMethod {
+pub enum HttpMethod {
     GET,
     POST,
     DELETE,

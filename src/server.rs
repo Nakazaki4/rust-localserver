@@ -1,4 +1,5 @@
 use crate::config::ServerConfig;
+use crate::http::{self, RequestParser};
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -43,7 +44,8 @@ struct Connection {
     pub listener_token: Token,
     pub last_activity: Instant,
     pub read_buffer: Vec<u8>,
-    pub is_request_complete: bool,
+    pub parser: RequestParser,
+    pub resolved_max_body: Option<usize>,
 }
 impl Connection {
     fn new(stream: TcpStream, listener_token: Token) -> Self {
@@ -52,7 +54,8 @@ impl Connection {
             listener_token,
             last_activity: Instant::now(),
             read_buffer: Vec::with_capacity(4096),
-            is_request_complete: false,
+            parser: RequestParser::new(),
+            resolved_max_body: None,
         }
     }
 }
@@ -159,7 +162,7 @@ impl Server {
             loop {
                 match conn.stream.read(&mut buf) {
                     Ok(0) => {
-                        self.close_connection();
+                        self.close_connection(connection_token);
                         return;
                     }
                     Ok(n) => {
@@ -170,15 +173,28 @@ impl Server {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) => {
                         eprintln!("read error on {connection_token:?}: {e}");
-                        self.close_connection(token);
+                        self.close_connection(connection_token);
                         return;
                     }
                 };
             }
 
-            // self.parse_request(event);
+            println!(
+                "---- request on {connection_token:?} ({} bytes) ----\n{}\n---- end ----",
+                conn.read_buffer.len(),
+                String::from_utf8_lossy(&conn.read_buffer)
+            );
         }
-        
+    }
+
+    fn close_connection(&mut self, token: Token) {
+        if let Some(mut conn) = self.connections.remove(&token) {
+            let _ = self.poll.registry().deregister(&mut conn.stream);
+        };
+        if let Some(mut cgi) = self.pending_cgi.remove(&token) {
+            let _ = cgi.child_process.kill();
+            let _ = cgi.child_process.wait();
+        }
     }
 
     fn accept_connection(&mut self, listener_token: Token) {

@@ -2,6 +2,8 @@ use crate::server::Server;
 
 mod config;
 mod server;
+mod http;
+
 fn main() {
     // first, parse the config file
     // then create the TcpListeners for each server
