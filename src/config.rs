@@ -31,7 +31,7 @@ pub enum HttpMethod {
 }
 
 impl HttpMethod {
-    fn parse(method: &str) -> Result<Self, String> {
+    pub fn parse(method: &str) -> Result<Self, String> {
         match method {
             "GET" => return Ok(HttpMethod::GET),
             "POST" => return Ok(HttpMethod::POST),

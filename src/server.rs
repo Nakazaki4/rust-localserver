@@ -184,6 +184,9 @@ impl Server {
                 conn.read_buffer.len(),
                 String::from_utf8_lossy(&conn.read_buffer)
             );
+
+            // parse the bytes into a string then an http string
+            conn.parser.parse(&buf, conn.resolved_max_body);
         }
     }
 
