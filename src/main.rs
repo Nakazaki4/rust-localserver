@@ -12,7 +12,7 @@ fn main() {
         Ok(configs) => {
             match Server::bind(configs) {
                 Ok(mut server) => server.run(),
-                Err(e) =>panic!("FOR SOME REASON PANICKED{e}"),
+                Err(e) =>panic!("FOR SOME REASON PANICED{e}"),
             };
         }
         Err(e) => panic!("{}", format!("error parsing your config file: {}", e)),

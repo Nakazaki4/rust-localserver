@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::{fmt, io};
 
-pub const SERVER_TOKEN_MAX: usize = 100;
+pub const SERVER_TOKEN_MAX: usize = 4;
 
 pub struct Server {
     poll: Poll,
@@ -74,6 +74,7 @@ impl Server {
         })
     }
 
+    // binding the listner to epoll instance
     pub fn bind(configs: Vec<ServerConfig>) -> Result<Server, String> {
         let mut server = Self::new()?;
 
@@ -126,8 +127,9 @@ impl Server {
         Ok(server)
     }
 
+    // start listening for connections
     pub fn run(&mut self) {
-        let mut events = Events::with_capacity(2048);
+        let mut events = Events::with_capacity(1024);
         loop {
             if let Err(e) = self
                 .poll
@@ -157,37 +159,35 @@ impl Server {
             None => return,
         };
 
-        if event.is_readable() {
-            let mut buf = [0u8; 4096];
-            loop {
-                match conn.stream.read(&mut buf) {
-                    Ok(0) => {
-                        self.close_connection(connection_token);
-                        return;
-                    }
-                    Ok(n) => {
-                        conn.read_buffer.extend_from_slice(&buf[..n]);
-                        conn.last_activity = Instant::now();
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => {
-                        eprintln!("read error on {connection_token:?}: {e}");
-                        self.close_connection(connection_token);
-                        return;
-                    }
-                };
-            }
-
-            println!(
-                "---- request on {connection_token:?} ({} bytes) ----\n{}\n---- end ----",
-                conn.read_buffer.len(),
-                String::from_utf8_lossy(&conn.read_buffer)
-            );
-
-            // parse the bytes into a string then an http string
-            conn.parser.parse(&buf, conn.resolved_max_body);
+        let mut buf = [0u8; 4096];
+        loop {
+            match conn.stream.read(&mut buf) {
+                Ok(0) => {
+                    self.close_connection(connection_token);
+                    return;
+                }
+                Ok(n) => {
+                    conn.read_buffer.extend_from_slice(&buf[..n]);
+                    conn.last_activity = Instant::now();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    eprintln!("read error on {connection_token:?}: {e}");
+                    self.close_connection(connection_token);
+                    return;
+                }
+            };
         }
+
+        println!(
+            "---- request on {connection_token:?} ({} bytes) ----\n{}\n---- end ----",
+            conn.read_buffer.len(),
+            String::from_utf8_lossy(&conn.read_buffer)
+        );
+
+        // parse the bytes into a string then an http string
+        conn.parser.parse(&buf, conn.resolved_max_body);
     }
 
     fn close_connection(&mut self, token: Token) {
