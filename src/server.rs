@@ -1,5 +1,5 @@
 use crate::config::ServerConfig;
-use crate::http::{self, RequestParser};
+use crate::http::{self, Request, RequestParser};
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -187,7 +187,12 @@ impl Server {
         );
 
         // parse the bytes into a string then an http string
-        conn.parser.parse(&buf, conn.resolved_max_body);
+        let parse_state = conn.parser.parse(&buf, conn.resolved_max_body);
+        println!("{:?}", parse_state);
+        // if the request chunks all arrived we close the connection
+        // if not then we do nothing
+        // if all arrives return the response or timeout
+        self.close_connection(connection_token);
     }
 
     fn close_connection(&mut self, token: Token) {
@@ -215,7 +220,7 @@ impl Server {
                     if let Err(e) = self.poll.registry().register(
                         &mut stream,
                         connection_token,
-                        Interest::READABLE,
+                        Interest::READABLE | Interest::WRITABLE,
                     ) {
                         eprintln!("registring the connection to Poll failed {e}");
                         continue;

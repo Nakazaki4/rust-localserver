@@ -1,5 +1,5 @@
 use crate::config::HttpMethod;
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Error, io::BufRead};
 
 pub struct Request {
     pub method: HttpMethod,
@@ -27,6 +27,7 @@ impl Request {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum ParseState {
     RequestLine,
     Headers,
@@ -55,57 +56,83 @@ impl RequestParser {
         }
     }
 
-    pub fn parse(&mut self, buf: &[u8], max_body: Option<usize>) {
+    pub fn parse(&mut self, buf: &[u8], max_body: Option<usize>) -> ParseState {
         loop {
             match self.state {
                 ParseState::RequestLine => {
                     if self.pos == 0 && buf.len() > MAX_HEADER_SIZE {
+                        eprintln!(
+                            "[parse:RequestLine] buffer too large: {} bytes (max {}) -> 400",
+                            buf.len(),
+                            MAX_HEADER_SIZE
+                        );
                         self.state = ParseState::Error(400);
                     }
                     let Some(line) = self.take_line(buf) else {
-                        return;
+                        break;
                     };
                     if line.is_empty() {
+                        eprintln!(
+                            "[parse:RequestLine] empty request line at pos {} -> 400",
+                            self.pos
+                        );
                         self.state = ParseState::Error(400);
+                        break;
                     }
                     if let Err(code) = self.parse_request_line(&line) {
+                        eprintln!(
+                            "[parse:RequestLine] invalid request line {:?} -> {}",
+                            line, code
+                        );
                         self.state = ParseState::Error(code);
-                        return;
+                        break;
                     };
                     self.state = ParseState::Headers;
                 }
                 ParseState::Headers => {
                     let Some(line) = self.take_line(buf) else {
-                        return;
+                        break;
                     };
 
                     if line.is_empty() {
                         if self.request.http_version == "HTTP/1.1"
                             && self.request.header("host").is_none()
                         {
+                            eprintln!(
+                                "[parse:Headers] HTTP/1.1 request missing Host header -> 400"
+                            );
                             self.state = ParseState::Error(400);
-                            return;
+                            break;
                         }
                         self.request.parse_cookies();
                         self.state = self.body_start_state();
                     } else if let Err(code) = self.parse_headers(&line) {
+                        eprintln!("[parse:Headers] invalid header line {:?} -> {}", line, code);
                         self.state = ParseState::Error(code);
-                        return;
+                        break;
                     }
-                    let content_length = self.request.headers.get("content-length")
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                    self.state = ParseState::Body { remaining: content_length }
+                    let content_length = self
+                        .request
+                        .headers
+                        .get("content-length")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    self.state = ParseState::Body {
+                        remaining: content_length,
+                    }
                 }
                 ParseState::Body { remaining } => {
-                    match self.request.is_chunked() {
-                        true => , // request chunked means we need to keep reading
-                        false => self.take_multilines(buf), // unchunked should be done in one read
-                    }
+                    let _ = match self.request.is_chunked() {
+                        true => self.take_body_chunk(buf, &max_body.unwrap()), // request chunked means we need to keep reading
+                        false => self.take_body(buf), // unchunked should be done in one read
+                    };
                 }
+
+                _ => {}
             }
         }
+        return self.state;
     }
 
     fn body_start_state(&mut self) -> ParseState {
@@ -114,35 +141,81 @@ impl RequestParser {
         } else {
             match self.request.content_length() {
                 Some(0) => ParseState::Complete,
-                Some(n)=> ParseState::Body { remaining:  }
-                None =>,
+                Some(n) => ParseState::Body { remaining: n },
+                None => ParseState::RequestLine,
             }
         }
     }
 
-    fn take_body_chunks(&mut self, section: &[u8]) -> Result<(), u16> {
-        let c = 
+    fn find(&mut self, chunk: &[u8], e: &[u8]) -> Option<usize> {
+        chunk.windows(e.len()).position(|w| w == e)
     }
 
-    fn take_multilines(&mut self, section: &[u8]) -> Result<(), u16> {
-            self.request.body.extend_from_slice(section);
+    fn take_body_chunk(&mut self, section: &[u8], max_body: &usize) -> Result<(), u16> {
+        let mut body = Vec::new();
+        let mut pos = 0;
+
+        loop {
+            // size line
+            let Some(rel) = self.find(&section[pos..], b"\r\n") else {
+                return Err(400);
+            };
+            let size_line = &section[pos..pos + rel];
+            pos += rel + 2;
+
+            let size_part = size_line.split(|&b| b == b';').next().unwrap_or(&[]);
+            let size_str = std::str::from_utf8(size_part).map_err(|_| 400u16)?.trim();
+            let size = usize::from_str_radix(size_str, 16).map_err(|_| 400u16)?;
+
+            if size == 0 {
+                loop {
+                    let Some(rel) = self.find(&section[pos..], b"\r\n") else {
+                        return Err(400);
+                    };
+                    if rel == 0 {
+                        self.request.body = body;
+                        return Ok(());
+                    }
+                    pos += rel + 2;
+                }
+            }
+
+            if body.len() + size > *max_body {
+                return Err(413);
+            }
+            if section.len() < pos + size + 2 {
+                return Ok(());
+            }
+            body.extend_from_slice(&section[pos..pos + size]);
+            if &section[pos + size..pos + size + 2] != b"\r\n" {
+                return Err(400);
+            }
+            pos += size + 2;
+            self.pos += size;
+        }
+    }
+
+    fn take_body(&mut self, section: &[u8]) -> Result<(), u16> {
+        self.request.body.extend_from_slice(section);
+        self.pos += self.request.body.len();
         Ok(())
     }
 
     fn parse_headers(&mut self, section: &String) -> Result<(), u16> {
         let lines: Vec<&str> = section.lines().collect();
-        
+
         for line in lines {
-            if line.len() !=2 {
+            if line.len() != 2 {
                 return Err(400);
             }
-            let mut parts  = line.split_ascii_whitespace();
+            let mut parts = line.split_ascii_whitespace();
             let key = parts.next().unwrap().to_string();
             let value = parts.next().unwrap().to_string();
             match key.to_ascii_lowercase().as_str() {
-                "content-type" | "transfer-encoding" | "cookie" | "connection" | "content-length"  => {
+                "content-type" | "transfer-encoding" | "cookie" | "connection"
+                | "content-length" => {
                     self.request.headers.insert(key, value);
-                },
+                }
                 _ => {}
             }
         }
@@ -189,15 +262,15 @@ impl Request {
     }
 
     fn is_chunked(&self) -> bool {
-    self.header("transfer-encoding")
-        .map(|v| {
-            v.split(',')
-                .last()
-                .map(|s| s.trim().eq_ignore_ascii_case("chunked"))
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
-}
+        self.header("transfer-encoding")
+            .map(|v| {
+                v.split(',')
+                    .last()
+                    .map(|s| s.trim().eq_ignore_ascii_case("chunked"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    }
 
     pub fn host(&self) -> Option<&str> {
         self.header("host")
