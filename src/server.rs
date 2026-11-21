@@ -1,10 +1,11 @@
 use crate::config::ServerConfig;
-use crate::http::{self, Request, RequestParser};
+use crate::handler::Handler;
+use crate::http::{ParseState, RequestParser};
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use std::{fmt, io};
@@ -39,6 +40,7 @@ struct PendingCgi {
     stdout: std::process::ChildStdout,
 }
 
+#[derive(Debug)]
 struct Connection {
     pub stream: TcpStream,
     pub listener_token: Token,
@@ -61,8 +63,6 @@ impl Connection {
 }
 
 impl Server {
-    /// Takes ALL server configs — there is exactly one Server and one Poll
-    /// for the whole program, no matter how many server blocks exist.
     pub fn new() -> Result<Self, String> {
         Ok(Server {
             poll: Poll::new().map_err(|e| format!("failed to create poll: {e}"))?,
@@ -152,47 +152,86 @@ impl Server {
     }
 
     fn handle_client_event(&mut self, event: &Event) {
-        let connection_token = event.token();
+        let token = event.token();
 
-        let conn = match self.connections.get_mut(&connection_token) {
-            Some(c) => c,
-            None => return,
+        // 1. read: drain the socket into conn.read_buffer
+        match self.read_from_client(token) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.close_connection(token);
+                return;
+            }
+            Err(e) => {
+                eprintln!("read error on {token:?}: {e}");
+                self.close_connection(token);
+                return;
+            }
+        }
+
+        // 2. process: parse what we have; None means the request is incomplete
+        let Some(response) = self.process_request(token) else {
+            return;
+        };
+
+        // 3. write
+        if let Err(e) = self.write_response(token, &response) {
+            eprintln!("write error on {token:?}: {e}");
+        }
+        self.close_connection(token);
+    }
+
+    /// Reads everything available. Ok(true) = connection still open, Ok(false) = peer closed.
+    fn read_from_client(&mut self, token: Token) -> io::Result<bool> {
+        let Some(conn) = self.connections.get_mut(&token) else {
+            return Ok(false);
         };
 
         let mut buf = [0u8; 4096];
         loop {
             match conn.stream.read(&mut buf) {
-                Ok(0) => {
-                    self.close_connection(connection_token);
-                    return;
-                }
+                Ok(0) => return Ok(false),
                 Ok(n) => {
                     conn.read_buffer.extend_from_slice(&buf[..n]);
                     conn.last_activity = Instant::now();
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    eprintln!("read error on {connection_token:?}: {e}");
-                    self.close_connection(connection_token);
-                    return;
-                }
-            };
+                Err(e) => return Err(e),
+            }
         }
 
         println!(
-            "---- request on {connection_token:?} ({} bytes) ----\n{}\n---- end ----",
+            "---- request on {token:?} ({} bytes) ----\n{}\n---- end ----",
             conn.read_buffer.len(),
             String::from_utf8_lossy(&conn.read_buffer)
         );
+        Ok(true)
+    }
 
-        // parse the bytes into a string then an http string
-        let parse_state = conn.parser.parse(&buf, conn.resolved_max_body);
-        println!("{:?}", parse_state);
-        // if the request chunks all arrived we close the connection
-        // if not then we do nothing
-        // if all arrives return the response or timeout
-        self.close_connection(connection_token);
+    /// Feeds the buffered bytes to the parser. Returns the response to send,
+    /// or None if more data is needed.
+    fn process_request(&mut self, token: Token) -> Option<Vec<u8>> {
+        let conn = self.connections.get_mut(&token)?;
+        conn.parser.parse(&conn.read_buffer, conn.resolved_max_body);
+
+        match conn.parser.state {
+            ParseState::Error(code) => Some(simple_response(code)),
+            ParseState::Complete => {
+                let entry = self.listeners.get(&conn.listener_token)?;
+                let config = select_config(&entry.configs, conn.parser.request.header("host"));
+                Handler::request_handler(&conn.parser.request, config);
+                Some(simple_response(200))
+            }
+            _ => None,
+        }
+    }
+
+    fn write_response(&mut self, token: Token, response: &[u8]) -> io::Result<()> {
+        let conn = self
+            .connections
+            .get_mut(&token)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "connection gone"))?;
+        conn.stream.write_all(response)
     }
 
     fn close_connection(&mut self, token: Token) {
@@ -237,6 +276,30 @@ impl Server {
             }
         }
     }
+}
+
+/// Picks the server block whose `host` matches the Host header ("site-b.local:8080" -> "site-b.local"),
+/// falling back to the first one (the default server for this address).
+fn select_config<'a>(configs: &'a [ServerConfig], host_header: Option<&str>) -> &'a ServerConfig {
+    let host_name = host_header.and_then(|h| h.split(':').next()).unwrap_or("");
+    configs
+        .iter()
+        .find(|c| c.host.eq_ignore_ascii_case(host_name))
+        .unwrap_or(&configs[0])
+}
+
+fn simple_response(code: u16) -> Vec<u8> {
+    let reason = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        505 => "HTTP Version Not Supported",
+        _ => "Internal Server Error",
+    };
+    format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .into_bytes()
 }
 
 impl fmt::Debug for Server {

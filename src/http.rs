@@ -1,6 +1,7 @@
 use crate::config::HttpMethod;
-use std::{collections::HashMap, fmt::Error, io::BufRead};
+use std::{collections::HashMap};
 
+#[derive(Debug)]
 pub struct Request {
     pub method: HttpMethod,
     pub uri: String,
@@ -10,8 +11,6 @@ pub struct Request {
     pub body: Vec<u8>,
     pub cookies: HashMap<String, String>,
 }
-
-pub struct Response {}
 
 impl Request {
     pub fn default() -> Self {
@@ -39,6 +38,7 @@ pub enum ParseState {
     Error(u16),
 }
 
+#[derive(Debug)]
 pub struct RequestParser {
     pub state: ParseState,
     pub request: Request,
@@ -56,7 +56,7 @@ impl RequestParser {
         }
     }
 
-    pub fn parse(&mut self, buf: &[u8], max_body: Option<usize>) -> ParseState {
+    pub fn parse(&mut self, buf: &[u8], max_body: Option<usize>) {
         loop {
             match self.state {
                 ParseState::RequestLine => {
@@ -111,16 +111,11 @@ impl RequestParser {
                         self.state = ParseState::Error(code);
                         break;
                     }
-                    let content_length = self
-                        .request
-                        .headers
-                        .get("content-length")
-                        .unwrap()
-                        .parse()
-                        .unwrap();
-                    self.state = ParseState::Body {
-                        remaining: content_length,
+
+                    if matches!(self.request.method, HttpMethod::GET) {
+                        break;
                     }
+                    self.state = ParseState::Body { remaining: 1 };
                 }
                 ParseState::Body { remaining } => {
                     let _ = match self.request.is_chunked() {
@@ -132,7 +127,6 @@ impl RequestParser {
                 _ => {}
             }
         }
-        return self.state;
     }
 
     fn body_start_state(&mut self) -> ParseState {
@@ -174,6 +168,7 @@ impl RequestParser {
                     };
                     if rel == 0 {
                         self.request.body = body;
+                        self.state = ParseState::Complete;
                         return Ok(());
                     }
                     pos += rel + 2;
@@ -205,15 +200,16 @@ impl RequestParser {
         let lines: Vec<&str> = section.lines().collect();
 
         for line in lines {
-            if line.len() != 2 {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() != 2 {
                 return Err(400);
             }
             let mut parts = line.split_ascii_whitespace();
             let key = parts.next().unwrap().to_string();
             let value = parts.next().unwrap().to_string();
             match key.to_ascii_lowercase().as_str() {
-                "content-type" | "transfer-encoding" | "cookie" | "connection"
-                | "content-length" => {
+                "content-type:" | "transfer-encoding:" | "cookie:" | "connection:"
+                | "content-length:" | "host:" => {
                     self.request.headers.insert(key, value);
                 }
                 _ => {}

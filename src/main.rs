@@ -3,6 +3,7 @@ use crate::server::Server;
 mod config;
 mod server;
 mod http;
+mod handler;
 
 fn main() {
     // first, parse the config file

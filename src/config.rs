@@ -12,18 +12,18 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone)]
 pub struct Route {
-    path: String,
-    methods: Vec<HttpMethod>,
-    root: String,
-    index: Option<String>,
-    redirect: Option<String>,
-    upload: bool,
-    directory_listing: bool,
-    cgi_extension: Option<String>,
-    cgi_interpreter: Option<String>,
+    pub path: String,
+    pub methods: Vec<HttpMethod>,
+    pub root: String,
+    pub index: Option<String>,
+    pub redirect: Option<String>,
+    pub upload: bool,
+    pub directory_listing: bool,
+    pub cgi_extension: Option<String>,
+    pub cgi_interpreter: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum HttpMethod {
     GET,
     POST,
