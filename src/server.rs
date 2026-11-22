@@ -1,5 +1,5 @@
 use crate::config::ServerConfig;
-use crate::handler::Handler;
+use crate::handler::request_handler;
 use crate::http::{ParseState, RequestParser};
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
@@ -172,6 +172,7 @@ impl Server {
         let Some(response) = self.process_request(token) else {
             return;
         };
+        // println!("{:?}", String::from_utf8(response));
 
         // 3. write
         if let Err(e) = self.write_response(token, &response) {
@@ -213,14 +214,13 @@ impl Server {
     fn process_request(&mut self, token: Token) -> Option<Vec<u8>> {
         let conn = self.connections.get_mut(&token)?;
         conn.parser.parse(&conn.read_buffer, conn.resolved_max_body);
-
         match conn.parser.state {
             ParseState::Error(code) => Some(simple_response(code)),
             ParseState::Complete => {
                 let entry = self.listeners.get(&conn.listener_token)?;
                 let config = select_config(&entry.configs, conn.parser.request.header("host"));
-                Handler::request_handler(&conn.parser.request, config);
-                Some(simple_response(200))
+                Some(request_handler(&conn.parser.request, config))
+                // Some(simple_response(200))
             }
             _ => None,
         }

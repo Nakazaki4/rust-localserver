@@ -1,5 +1,5 @@
 use crate::config::HttpMethod;
-use std::{collections::HashMap};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct Request {
@@ -113,6 +113,7 @@ impl RequestParser {
                     }
 
                     if matches!(self.request.method, HttpMethod::GET) {
+                        self.state = ParseState::Complete;
                         break;
                     }
                     self.state = ParseState::Body { remaining: 1 };
@@ -205,15 +206,14 @@ impl RequestParser {
                 return Err(400);
             }
             let mut parts = line.split_ascii_whitespace();
-            let key = parts.next().unwrap().to_string();
+            let key = parts
+                .next()
+                .unwrap()
+                .to_string()
+                .trim_end_matches(':')
+                .to_ascii_lowercase();
             let value = parts.next().unwrap().to_string();
-            match key.to_ascii_lowercase().as_str() {
-                "content-type:" | "transfer-encoding:" | "cookie:" | "connection:"
-                | "content-length:" | "host:" => {
-                    self.request.headers.insert(key, value);
-                }
-                _ => {}
-            }
+            self.request.headers.insert(key.to_ascii_lowercase(), value);
         }
         Ok(())
     }
