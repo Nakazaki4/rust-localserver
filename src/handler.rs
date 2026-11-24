@@ -16,6 +16,7 @@ pub fn request_handler(request: &Request, config: &ServerConfig) -> Vec<u8> {
     if let Some(target) = &route.redirect {
         return redirect_response(target);
     }
+    println!("ccccc: {:?}", request.method);
     match request.method {
         HttpMethod::GET => handle_get(request, route),
         HttpMethod::POST => handle_post(request, route),

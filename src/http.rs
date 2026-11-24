@@ -90,33 +90,27 @@ impl RequestParser {
                     self.state = ParseState::Headers;
                 }
                 ParseState::Headers => {
-                    let Some(line) = self.take_line(buf) else {
-                        break;
-                    };
-
-                    if line.is_empty() {
-                        if self.request.http_version == "HTTP/1.1"
-                            && self.request.header("host").is_none()
-                        {
-                            eprintln!(
-                                "[parse:Headers] HTTP/1.1 request missing Host header -> 400"
-                            );
-                            self.state = ParseState::Error(400);
+                    match self.take_headers(buf) {
+                        Ok(true) => {
+                            if self.request.http_version == "HTTP/1.1"
+                                && self.request.header("host").is_none()
+                            {
+                                eprintln!(
+                                    "[parse:Headers] HTTP/1.1 request missing Host header -> 400"
+                                );
+                                self.state = ParseState::Error(400);
+                                break;
+                            }
+                            self.request.parse_cookies();
+                            self.state = self.body_start_state();
+                        }
+                        Ok(false) => return, // wait for more data
+                        Err(code) => {
+                            eprintln!("[parse:Headers] invalid header block -> {code}");
+                            self.state = ParseState::Error(code);
                             break;
                         }
-                        self.request.parse_cookies();
-                        self.state = self.body_start_state();
-                    } else if let Err(code) = self.parse_headers(&line) {
-                        eprintln!("[parse:Headers] invalid header line {:?} -> {}", line, code);
-                        self.state = ParseState::Error(code);
-                        break;
                     }
-
-                    if matches!(self.request.method, HttpMethod::GET) {
-                        self.state = ParseState::Complete;
-                        break;
-                    }
-                    self.state = ParseState::Body { remaining: 1 };
                 }
                 ParseState::Body { remaining } => {
                     let _ = match self.request.is_chunked() {
@@ -193,16 +187,18 @@ impl RequestParser {
 
     fn take_body(&mut self, section: &[u8]) -> Result<(), u16> {
         self.request.body.extend_from_slice(section);
+        println!("body: {:?}", String::from_utf8(self.request.body.clone()));
         self.pos += self.request.body.len();
+        self.state = ParseState::Complete;
         Ok(())
     }
 
     fn parse_headers(&mut self, section: &String) -> Result<(), u16> {
         let lines: Vec<&str> = section.lines().collect();
-
         for line in lines {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() != 2 {
+                println!("vvvv{:?}", parts);
                 return Err(400);
             }
             let mut parts = line.split_ascii_whitespace();
@@ -247,6 +243,35 @@ impl RequestParser {
         let line = String::from_utf8_lossy(&slice[..end]).into_owned();
         self.pos += end + 2;
         Some(line)
+    }
+
+    fn take_headers(&mut self, buf: &[u8]) -> Result<bool, u16> {
+        let slice = buf.get(self.pos..).ok_or(400u16)?;
+
+        if slice.starts_with(b"\r\n") {
+            self.pos += 2;
+            return Ok(true);
+        }
+
+        let Some(end) = slice.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return Ok(false); // incomplete
+        };
+
+        let block = std::str::from_utf8(&slice[..end]).map_err(|_| 400u16)?;
+
+        for line in block.split("\r\n") {
+            let (name, value) = line.split_once(':').ok_or(400u16)?; // no ':' → 400
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(400);
+            }
+            self.request
+                .headers
+                .insert(name.to_ascii_lowercase(), value.trim().to_string());
+        }
+        println!("cc{:?}", self.request.headers);
+        self.pos += end + 4;
+        Ok(true)
     }
 }
 
