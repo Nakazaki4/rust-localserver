@@ -201,11 +201,11 @@ impl Server {
             }
         }
 
-        println!(
-            "---- request on {token:?} ({} bytes) ----\n{}\n---- end ----",
-            conn.read_buffer.len(),
-            String::from_utf8_lossy(&conn.read_buffer)
-        );
+        // println!(
+        //     "---- request on {token:?} ({} bytes) ----\n{}\n---- end ----",
+        //     conn.read_buffer.len(),
+        //     String::from_utf8_lossy(&conn.read_buffer)
+        // );
         Ok(true)
     }
 

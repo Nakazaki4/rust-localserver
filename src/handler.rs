@@ -1,9 +1,18 @@
-use std::{os, path::{Path, PathBuf}};
+use std::{
+    os,
+    path::{Path, PathBuf},
+    process,
+};
 
 use crate::{
     config::{HttpMethod, Route, ServerConfig},
     http::Request,
 };
+
+struct UploadedFile {
+    filename: String,
+    data: Vec<u8>,
+}
 
 pub fn request_handler(request: &Request, config: &ServerConfig) -> Vec<u8> {
     // 404 if no route matches, 405 if the method isn't allowed
@@ -16,7 +25,7 @@ pub fn request_handler(request: &Request, config: &ServerConfig) -> Vec<u8> {
     if let Some(target) = &route.redirect {
         return redirect_response(target);
     }
-    println!("ccccc: {:?}", request.method);
+
     match request.method {
         HttpMethod::GET => handle_get(request, route),
         HttpMethod::POST => handle_post(request, route),
@@ -25,33 +34,107 @@ pub fn request_handler(request: &Request, config: &ServerConfig) -> Vec<u8> {
 }
 
 fn handle_post(request: &Request, route: &Route) -> Vec<u8> {
-    // get the request body and store it in a file in the root
-    let file_name = request
+    // 1. The boundary comes from the request's Content-Type header
+    let Some(boundary) = request
         .headers
-        .get("content-disposition")
-        .unwrap()
-        .split(';')
-        .map(|p| p.trim())
-        .find_map(|p| p.strip_prefix("filename="))
-        .map(|f| f.trim_matches('"'));
+        .get("content-type")
+        .filter(|ct| ct.starts_with("multipart/form-data"))
+        .and_then(|ct| get_boundary(ct))
+    else {
+        return error_response(400);
+    };
+
+    // 2. Pull the file parts (filename + raw bytes) out of the body
+    let files = match parse_multipart(&request.body, boundary) {
+        Ok(f) if !f.is_empty() => f,
+        _ => return error_response(400),
+    };
+
+    // 3. Save each file under a safe name
     let save_dir = PathBuf::from(&route.root);
-    let file_path = save_dir.join(file_name.unwrap());
-    match std::fs::write(&file_path, &request.body) {
-        Ok(()) => {
-            let body = format!(
-                "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>Upload successful</title></head>\
-             <body><h1>Upload successful</h1></body></html>"
-            );
-            build_response(201, "text/html; charset=utf-8", body.into_bytes());
-        }
-        Err(e) => {
+    for file in &files {
+        let file_path = save_dir.join(&file.filename);
+        if let Err(e) = std::fs::write(&file_path, &file.data) {
             eprintln!("failed to write {}: {e}", file_path.display());
-            error_response(500);
+            return error_response(500);
         }
     }
 
-    return Vec::new();
+    // 4. Success: this is the function's return value (no `;`)
+    let body = "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><title>Upload successful</title></head>\
+                <body><h1>Upload successful</h1></body></html>";
+    build_response(201, "text/html; charset=utf-8", body.as_bytes().to_vec())
 }
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn parse_multipart(body: &[u8], boundary: &str) -> Result<Vec<UploadedFile>, u16> {
+    println!("boundary: {:?}", String::from(boundary));
+    let delimiter = format!("{boundary}").into_bytes();
+    let end_marker = format!("\r\n{boundary}").into_bytes();
+    let mut files = Vec::new();
+
+    // Step 1: jump to just after the first delimiter
+    let first = find(body, &delimiter).ok_or(400u16)?;
+    let mut pos = first + delimiter.len();
+
+    loop {
+        // Step 2: what follows a delimiter?
+        let rest = body.get(pos..).ok_or(400u16)?;
+        if rest.starts_with(b"--") {
+            break; // "--B--": the last delimiter, done
+        }
+        if !rest.starts_with(b"\r\n") {
+            return Err(400); // malformed
+        }
+        pos += 2;
+
+        // Step 3: the part's headers end at \r\n\r\n
+        let rel = find(&body[pos..], b"\r\n\r\n").ok_or(400u16)?;
+        let headers = std::str::from_utf8(&body[pos..pos + rel]).map_err(|_| 400u16)?;
+        let data_start = pos + rel + 4;
+
+        // Step 4: the data ends right before "\r\n--B"
+        let rel = find(&body[data_start..], &end_marker).ok_or(400u16)?;
+        let data_end = data_start + rel;
+
+        // Step 5: a part is a file only if it has a filename
+        let filename = headers
+            .split("\r\n")
+            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+            .and_then(get_filename);
+
+        if let Some(name) = filename {
+            files.push(UploadedFile {
+                filename: name.to_string(),
+                data: body[data_start..data_end].to_vec(),
+            });
+        }
+
+        // Step 6: move past "\r\n--B"; the loop then checks for "--" or "\r\n"
+        pos = data_end + end_marker.len();
+    }
+
+    Ok(files)
+}
+
+fn get_filename(disposition: &str) -> Option<&str> {
+    disposition
+        .split(';')
+        .map(|p| p.trim())
+        .find_map(|p| p.strip_prefix("filename="))
+        .map(|f| f.trim_matches('"'))
+}
+
+fn get_boundary(s: &String) -> Option<&str> {
+    let boundary = s.split(|b| b == ';').next().unwrap_or("");
+    let v = boundary.split(|b| b == '=').next().unwrap();
+    println!("b: {}", String::from(v));
+    Some(v)
+}
+
 fn handle_delete(request: &Request, route: &Route) -> Vec<u8> {
     return Vec::new();
 }
